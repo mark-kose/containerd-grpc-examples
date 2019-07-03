@@ -1,0 +1,204 @@
+package main
+
+import (
+        "context"
+        "encoding/json"
+        ec "envoy/api/v2/core"
+        pb "envoy/service/auth/v2"
+        et "envoy/type"
+        "github.com/gorilla/sessions"
+        "golang.org/x/oauth2"
+        status "google.golang.org/genproto/googleapis/rpc/status"
+        "google.golang.org/grpc"
+        "google.golang.org/grpc/reflection"
+        "log"
+        "net"
+        "net/http"
+        "net/http/httptest"
+        "net/url"
+        "os"
+        "strings"
+)
+
+const gitHubClientID = YOUR CLIENT ID HERE
+const gitHubClientSecret = YOUR SECRET HERE
+
+const sessionName = "containerd-session-id"
+
+// User Autherization Status Codes
+const (
+        UserAllowed            = 0
+        UserAuthGeneralProblem = 1
+        UserNotLoggedIn        = 2
+        UserNotAllowed         = 3
+        UserSet                = 4
+        UserNotSet             = 5
+)
+
+// For this example, I'm allowing github account login. Of course user list should come from a database,etc. in a final implementation
+var allowedUsers = [1]string{"mark-kose"}
+
+// I'm only interested in login and id from GitHub user api call, so I'll map the json result to this struct
+type gitHubUser struct {
+        Login string `json:"login"`
+        Id    int32  `json:"id"`
+}
+
+type server struct{}
+
+var store = sessions.NewCookieStore([]byte((os.Getenv("SESSION_KEY"))))
+
+func main() {
+        log.Printf("Starting envoy Auth gRPC Service")
+        listener, err := net.Listen("tcp", ":10003")
+        if err != nil {
+                panic(err)
+        }
+        srv := grpc.NewServer()
+        pb.RegisterAuthorizationServer(srv, &server{})
+        reflection.Register(srv)
+        if e := srv.Serve(listener); e != nil {
+                panic(err)
+        }
+
+}
+
+// This function makes OAuth2 call to GitHub to request access to users login. Then it uses Gorilla sessions to  add a Set-Cookie header to Envoy response and redirects the user to home page, so next time request comes in we can check this cookie.
+func setUserFromGitHub(ctx context.Context, request *pb.CheckRequest) (string, int32) {
+        githubConf := &oauth2.Config{
+                ClientID:     gitHubClientID,
+                ClientSecret: gitHubClientSecret,
+                Endpoint: oauth2.Endpoint{
+                        AuthURL:  "https://github.com/login/oauth/authorize",
+                        TokenURL: "https://github.com/login/oauth/access_token",
+                },
+        }
+        u, err := url.Parse(request.Attributes.Request.Http.Path)
+        if err != nil {
+                return "", UserNotSet
+        }
+        q := u.Query()
+        gitHubAccessToken, err := githubConf.Exchange(oauth2.NoContext, q["code"][0])
+        if err != nil {
+                return "", UserNotSet
+        }
+
+        user := gitHubUser{}
+        getJsonWithOauth2(githubConf, "https://api.github.com/user", gitHubAccessToken.AccessToken, &user)
+
+        newRequest, err := http.NewRequest(request.Attributes.Request.Http.Method, request.Attributes.Request.Http.Path, nil)
+        if err != nil {
+                log.Println(err)
+                return "", UserNotSet
+        }
+
+        // Gorilla  sessions used here
+        session, err := store.Get(newRequest, sessionName)
+        if err != nil {
+                log.Println(err.Error())
+                return "", UserNotSet
+        }
+
+        session.Values["github_user_id"] = user.Login
+        httpResponse := httptest.NewRecorder()
+        session.Save(newRequest, httpResponse)
+        // Return the Set-Cookie header et by Gorilla
+        return httpResponse.Header().Get("Set-Cookie"), UserSet
+}
+
+// This function checks if user is allowed to access based on the user-login
+func userAllowed(ctx context.Context, request *pb.CheckRequest) int32 {
+        newRequest, err := http.NewRequest(request.Attributes.Request.Http.Method, request.Attributes.Request.Http.Path, nil)
+        if err != nil {
+                log.Println(err.Error())
+                return UserAuthGeneralProblem
+        }
+        cookieHeader := http.Header{"Cookie": {request.Attributes.Request.Http.Headers["cookie"]}}
+        newRequest.Header = cookieHeader
+        session, err := store.Get(newRequest, sessionName)
+        if err != nil {
+                log.Println(err.Error())
+                return UserAuthGeneralProblem
+        }
+
+        userFromSession := session.Values["github_user_id"]
+        if userFromSession == nil {
+                log.Println("User not logged in")
+                return UserNotLoggedIn
+        }
+        for _, user := range allowedUsers {
+                if user == userFromSession {
+                        return UserAllowed
+                }
+        }
+        return UserNotAllowed
+
+}
+
+// This is the gRPC Method Function that Envoy calls to check if request is authorized or not. It uses signature generated by the proto compiler.
+
+func (s *server) Check(ctx context.Context, request *pb.CheckRequest) (*pb.CheckResponse, error) {
+        authStatus := status.Status{Code: 7}
+
+        if uri := request.Attributes.Request.Http.Path; strings.HasPrefix(uri, "/auth/github/callback") {
+                var headers []*ec.HeaderValueOption
+                setCookieValue, userSetResult := setUserFromGitHub(ctx, request)
+                if UserNotSet == userSetResult {
+                        headers = []*ec.HeaderValueOption{{Header: &ec.HeaderValue{Key: "Location", Value: "/public/login.html"}}}
+
+                } else {
+                        headers = []*ec.HeaderValueOption{{Header: &ec.HeaderValue{Key: "Location", Value: "/index.html"}}, {Header: &ec.HeaderValue{Key: "Set-Cookie", Value: setCookieValue}}}
+                }
+                authStatus := status.Status{Code: 7}
+                httpStatus := et.HttpStatus{Code: et.StatusCode_Found}
+                deniedResponse := pb.DeniedHttpResponse{Status: &httpStatus, Headers: headers}
+                cResponse := pb.CheckResponse_DeniedResponse{DeniedResponse: &deniedResponse}
+                return &pb.CheckResponse{Status: &authStatus, HttpResponse: &cResponse}, nil
+        }
+
+        allowedStatus := userAllowed(ctx, request)
+        var cResponse pb.CheckResponse_DeniedResponse
+
+        if allowedStatus == UserAllowed {
+                authStatus = status.Status{Code: 0}
+                return &pb.CheckResponse{Status: &authStatus}, nil
+
+        } else if allowedStatus == UserNotAllowed {
+
+                authStatus = status.Status{Code: 7}
+                httpStatus := et.HttpStatus{Code: et.StatusCode_OK}
+                deniedResponse := pb.DeniedHttpResponse{Status: &httpStatus, Headers: []*ec.HeaderValueOption{{Header: &ec.HeaderValue{Key: "content-type", Value: "text/html"}}}, Body: "<h1>You are not allowed to use this site </h1>"}
+                cResponse = pb.CheckResponse_DeniedResponse{DeniedResponse: &deniedResponse}
+                return &pb.CheckResponse{Status: &authStatus, HttpResponse: &cResponse}, nil
+        } else if allowedStatus == UserNotLoggedIn {
+                authStatus := status.Status{Code: 7}
+                httpStatus := et.HttpStatus{Code: et.StatusCode_Found}
+                deniedResponse := pb.DeniedHttpResponse{Status: &httpStatus, Headers: []*ec.HeaderValueOption{{Header: &ec.HeaderValue{Key: "Location", Value: "/public/login.html"}}}}
+
+                cResponse = pb.CheckResponse_DeniedResponse{DeniedResponse: &deniedResponse}
+                return &pb.CheckResponse{Status: &authStatus, HttpResponse: &cResponse}, nil
+
+        } else {
+                authStatus = status.Status{Code: 7}
+                httpStatus := et.HttpStatus{Code: et.StatusCode_Found}
+                deniedResponse := pb.DeniedHttpResponse{Status: &httpStatus, Headers: []*ec.HeaderValueOption{{Header: &ec.HeaderValue{Key: "content-type", Value: "text/html"}}}, Body: "<h1>Something went wrong </h1>"}
+
+                cResponse = pb.CheckResponse_DeniedResponse{DeniedResponse: &deniedResponse}
+                return &pb.CheckResponse{Status: &authStatus, HttpResponse: &cResponse}, nil
+
+        }
+
+}
+
+// Found this useful function on Stackoverflow that makes OAuth2 call to a URL to get JSON response and decode that to an interface. In this exercise, we are using it to call "https://api.github.com/user to get logged in user credential and extract login and id to map to gitHubUser
+func getJsonWithOauth2(oauth2Config *oauth2.Config, url string, strToken string, target interface{}) error {
+        tok := &oauth2.Token{AccessToken: strToken, TokenType: "bearer"}
+        client := oauth2Config.Client(oauth2.NoContext, tok)
+        r, err := client.Get(url)
+        if err != nil {
+                return err
+        }
+        defer r.Body.Close()
+
+        return json.NewDecoder(r.Body).Decode(target)
+}
