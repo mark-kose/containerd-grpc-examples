@@ -62,7 +62,7 @@ func main() {
 		Handler: grpcHandlerFunc(mux),
 	}
 
-	fmt.Printf("Staring HTTP/REST server on port: %d\n", restPort)
+	fmt.Printf("Starting HTTP/REST server on port: %d\n", restPort)
 	if err := srv.ListenAndServe(); err != nil {
 		panic(err)
 	}
