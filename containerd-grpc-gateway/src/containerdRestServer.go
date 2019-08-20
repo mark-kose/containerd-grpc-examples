@@ -7,13 +7,11 @@ import (
 	"github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/metadata"
 	"net/http"
 )
 
 const (
-	restPort   = 8080
-	GRPCHeader = "containerd-namespace"
+	restPort = 8080
 )
 
 var (
@@ -27,22 +25,10 @@ func grpcHandlerFunc(otherHandler http.Handler) http.Handler {
 	})
 }
 
-func withGRPCNamespaceHeader(ctx context.Context, namespace string) context.Context {
-	nsheader := metadata.Pairs(GRPCHeader, namespace)
-	md, ok := metadata.FromOutgoingContext(ctx)
-	if !ok {
-		md = nsheader
-	} else {
-		md = metadata.Join(nsheader, md)
-	}
-
-	return metadata.NewOutgoingContext(ctx, md)
-}
-
 func main() {
 	containerdAddr = "unix:///run/containerd/containerd.sock"
 	restAddr = fmt.Sprintf(":%d", restPort)
-	ctx := withGRPCNamespaceHeader(context.Background(), "examplectr")
+	ctx := context.Background()
 	dopts := []grpc.DialOption{grpc.WithInsecure()}
 	mux := http.NewServeMux()
 	m := new(gateway.JSONPb)
