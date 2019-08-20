@@ -2,14 +2,14 @@ syntax = "proto3";
 
 package containerd.services.images.v1;
 
+import weak "gogoproto/gogo.proto";
 import "google/protobuf/empty.proto";
 import "google/protobuf/field_mask.proto";
 import "google/protobuf/timestamp.proto";
-//import "descriptor.proto";
 import "github.com/containerd/containerd/api/types/descriptor.proto";
 
 option go_package = "github.com/containerd/containerd/api/services/images/v1;images";
-option (gogoproto.goproto_registration) = true; option (gogoproto.gogoproto_import) = true;
+
 // Images is a service that allows one to register images with containerd.
 //
 // In containerd, an image is merely the mapping of a name to a content root,
